@@ -1,0 +1,10 @@
+### post url
+POST http://localhost:8080/
+Content-Type: application/json
+
+{
+    "url":"https://www.baidu.com"
+}
+
+### get page
+GET http://localhost:8080/IDS6jR
