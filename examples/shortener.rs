@@ -9,10 +9,20 @@ use axum::{
 use nanoid::nanoid;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool};
+use thiserror::Error;
 use tokio::net::TcpListener;
 use tracing::{info, level_filters::LevelFilter, warn};
 use tracing_subscriber::{fmt::Layer, layer::SubscriberExt, util::SubscriberInitExt, Layer as _};
 
+#[derive(Debug, Error)]
+enum ShortenError {
+    #[error("Connect Database Error:{0}")]
+    Database(String),
+    #[error("Sqlx Error:{0}")]
+    SqlxQuery(#[from] sqlx::Error),
+    #[error("Url parse Error:{0}")]
+    UrlParse(String),
+}
 #[derive(Debug, Clone)]
 struct AppState {
     pool: PgPool,
@@ -92,12 +102,21 @@ async fn redirect(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, StatusCode> {
     // 数据库查询url
-    let url = state.get_url(id).await.map_err(|_| StatusCode::NOT_FOUND)?;
+    let url = state.get_url(&id).await.map_err(|e| {
+        warn!("#106:{}", e);
+        StatusCode::NOT_FOUND
+    })?;
 
     // 创建HTTP协议Header，并插入location头
     let mut header = HeaderMap::new();
     // url从String类型convert成Url类型，如果Url不合法抛出错误
-    let url = url.parse().map_err(|_e| StatusCode::NOT_FOUND)?;
+    // TODO www.baidu.com返回response，浏览器无法解析时，当作相对路径发起重定向请求，造成错误
+    // TODO 只有在url完整、解析成功时才会被当作绝对路径
+    let url = url.parse().map_err(|e| {
+        let e = ShortenError::UrlParse(format!("{} parse error:{}", url, e));
+        warn!("#115:{}", e);
+        StatusCode::NOT_FOUND
+    })?;
     header.insert(LOCATION, url);
 
     // 返回状态码+header
@@ -107,8 +126,13 @@ async fn redirect(
 impl AppState {
     async fn try_new(url: &str) -> Result<Self> {
         // 连接postgres
-        let pool = PgPool::connect(url).await?;
-
+        let pool = PgPool::connect(url).await;
+        let pool = match pool {
+            Ok(p) => p,
+            Err(e) => {
+                return Err(ShortenError::Database(e.to_string()).into());
+            }
+        };
         // 执行创建urls sql
         sqlx::query(
             r#"
@@ -118,7 +142,8 @@ impl AppState {
         )"#,
         )
         .execute(&pool)
-        .await?;
+        .await
+        .map_err(ShortenError::SqlxQuery)?;
 
         Ok(Self { pool })
     }
@@ -140,23 +165,36 @@ impl AppState {
         // let id=nanoid!(6);
         // 要将返回的数据解构成结构体，不是serde的serialize；而是sql的FromRow trait
         // exclude.url使用新值更新
-        let ret:Urls=sqlx::query_as(
+        let ret=sqlx::query_as::<_,Urls>(
             "insert into urls(id,url) values($1,$2) on conflict(url) do update set id=excluded.id returning id"
         )
         .bind(&id)
         .bind(&url)
         .fetch_one(&self.pool)
-        .await?;
+        .await;
+
+        let ret = match ret {
+            Ok(ret) => ret,
+            Err(e) => {
+                return Err(ShortenError::SqlxQuery(e).into());
+            }
+        };
 
         Ok(ret.id)
     }
 
-    async fn get_url(&self, id: String) -> Result<String> {
-        let ret: Urls = sqlx::query_as("select url from urls where id=$1")
-            .bind(&id)
+    async fn get_url(&self, key: &str) -> Result<String> {
+        let ret = sqlx::query_as::<_, Urls>("select url from urls where id=$1")
+            .bind(key)
             .fetch_one(&self.pool)
-            .await?;
+            .await;
+        let url = match ret {
+            Ok(ret) => ret.url,
+            Err(e) => {
+                return Err(ShortenError::SqlxQuery(e).into());
+            }
+        };
 
-        Ok(ret.url)
+        Ok(url)
     }
 }
